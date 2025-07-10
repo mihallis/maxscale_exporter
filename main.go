@@ -3,7 +3,7 @@ package main
 import (
 	"flag"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -149,26 +149,26 @@ func (m *MaxScale) Collect(ch chan<- prometheus.Metric) {
 	ch <- m.totalScrapes
 }
 
-func (m *MaxScale) getStatistics(path string) []byte {
-
+func (m *MaxScale) getStatistics(path string) ([]byte, error) {
 	url := "http://" + m.Address + "/v1" + path
-
 	req, _ := http.NewRequest("GET", url, nil)
 
 	res, err := http.DefaultClient.Do(req)
 
 	if err != nil {
-		fmt.Printf("Error while doing request %v: %v\n", path, err)
+		return nil, fmt.Errorf("error while doing request %v: %v", path, err)
 	}
 
-	defer res.Body.Close()
-	body, err := ioutil.ReadAll(res.Body)
+	defer func(Body io.ReadCloser) {
+		_ = Body.Close()
+	}(res.Body)
+	body, err := io.ReadAll(res.Body)
 
 	if err != nil {
-		fmt.Printf("Error while getting %v: %v\n", path, err)
+		return nil, fmt.Errorf("error while getting %v: %v", path, err)
 	}
 
-	return body
+	return body, nil
 
 }
 
@@ -208,26 +208,27 @@ func (m *MaxScale) parseServices(ch chan<- prometheus.Metric) error {
 		nodeList{"avg_selects_per_session"},
 	}
 
-	body := m.getStatistics("/services")
+	body, err := m.getStatistics("/services")
+	if err != nil {
+		return err
+	}
 
 	// Loop in different services
-	jsonparser.ArrayEach(body, func(value []byte, dataType jsonparser.ValueType, offset int, err error) {
+	_, _ = jsonparser.ArrayEach(body, func(value []byte, dataType jsonparser.ValueType, offset int, err error) {
 
 		// Get id service
-		idRouter, err := jsonparser.GetString(value, "id")
-
-		if err != nil {
-			fmt.Println(err)
+		idRouter, routerErr := jsonparser.GetString(value, "id")
+		if routerErr != nil {
+			panic(routerErr)
 		}
 
 		// Loop in ["attributes"]["router_diagnostics"] of a service
-		jsonparser.ObjectEach(value, func(key []byte, value2 []byte, dataType jsonparser.ValueType, offset int) error {
+		_ = jsonparser.ObjectEach(value, func(key []byte, value2 []byte, dataType jsonparser.ValueType, offset int) error {
 			for _, router := range routers {
-				if string(key) == string(router.Name) {
+				if string(key) == router.Name {
 					floatTemp, err := strconv.ParseFloat(string(value2), 64)
-
 					if err != nil {
-						fmt.Println(err)
+						return err
 					}
 
 					connectionsMetric := m.routerMetrics[router.Name]
@@ -242,38 +243,41 @@ func (m *MaxScale) parseServices(ch chan<- prometheus.Metric) error {
 				if string(key) == "server_query_statistics" {
 
 					// Loop in server_query_statistics
-					jsonparser.ArrayEach(value2, func(value3 []byte, dataType jsonparser.ValueType, offset int, err error) {
+					_, _ = jsonparser.ArrayEach(value2, func(value3 []byte, dataType jsonparser.ValueType, offset int, err error) {
 
 						// get id node
-						idNode, _ := jsonparser.GetString(value3, "id")
+						idNode, err := jsonparser.GetString(value3, "id")
+						if err != nil {
+							panic(err)
+						}
 
 						// loop in objects of server_query_statistics
-						jsonparser.ObjectEach(value3, func(key2 []byte, value4 []byte, dataType jsonparser.ValueType, offset int) error {
+						_ = jsonparser.ObjectEach(value3, func(key2 []byte, value4 []byte, dataType jsonparser.ValueType, offset int) error {
 							for _, node := range nodes {
-								if string(key2) == string(node.Name) {
+								if string(key2) == node.Name {
 									if string(node.Name) == "avg_sess_duration" {
 										if string(value4)[len(string(value4))-2:] == "ms" {
 											floatTempNode, err = strconv.ParseFloat(strings.TrimSuffix(string(value4), "ms"), 64)
 											if err != nil {
-												fmt.Println(err)
+												return err
 											}
 											floatTempNode = floatTempNode / 1000
 										} else {
 											floatTempNode, err = strconv.ParseFloat(strings.TrimSuffix(string(value4), "s"), 64)
 											if err != nil {
-												fmt.Println(err)
+												return err
 											}
 										}
 									} else {
 										floatTempNode, err = strconv.ParseFloat(string(value4), 64)
 										if err != nil {
-											fmt.Println(err)
+											return err
 										}
 
 									}
 
 									if err != nil {
-										fmt.Println(err)
+										return err
 									}
 
 									nodeConnectionsMetric := m.nodeMetrics[node.Name]
@@ -303,23 +307,25 @@ func (m *MaxScale) parseServices(ch chan<- prometheus.Metric) error {
 }
 
 func (m *MaxScale) parseServers(ch chan<- prometheus.Metric) error {
+	var body, err = m.getStatistics("/servers")
+	if err != nil {
+		return err
+	}
 
-	body := m.getStatistics("/servers")
-
-	jsonparser.ArrayEach(body, func(value []byte, dataType jsonparser.ValueType, offset int, err error) {
+	_, _ = jsonparser.ArrayEach(body, func(value []byte, dataType jsonparser.ValueType, offset int, err error) {
 
 		// Get id service
-		idRouter, err := jsonparser.GetString(value, "id")
+		idRouter, routerErr := jsonparser.GetString(value, "id")
 
-		if err != nil {
-			fmt.Println(err)
+		if routerErr != nil {
+			fmt.Println(routerErr)
 		}
 
 		// get string ["state"]
-		stringStateNode, err := jsonparser.GetString(value, "attributes", "state")
+		stringStateNode, stateNodeErr := jsonparser.GetString(value, "attributes", "state")
 
-		if err != nil {
-			fmt.Println(err)
+		if stateNodeErr != nil {
+			fmt.Println(stateNodeErr)
 		}
 
 		// gather status/master of nodes
@@ -373,7 +379,7 @@ func main() {
 	prometheus.MustRegister(exporter)
 	http.Handle(metricsPath, promhttp.Handler())
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte(`<html>
+		_, _ = w.Write([]byte(`<html>
 			<head><title>MaxScale Exporter</title></head>
 			<body>
 			<h1>MaxScale Exporter</h1>
